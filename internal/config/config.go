@@ -7,9 +7,10 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 type Config struct {
@@ -100,52 +101,52 @@ func defaultConfig() Config {
 }
 
 type rawConfig struct {
-	ConfigSource *rawConfigSource
-	Server       *rawServerConfig
-	MySQL        *rawMySQLConfig
-	Redis        *rawRedisConfig
-	ShortURL     *rawShortURLConfig
-	Internal     *rawInternalConfig
+	ConfigSource *rawConfigSource   `toml:"config_source"`
+	Server       *rawServerConfig   `toml:"server"`
+	MySQL        *rawMySQLConfig    `toml:"mysql"`
+	Redis        *rawRedisConfig    `toml:"redis"`
+	ShortURL     *rawShortURLConfig `toml:"short_url"`
+	Internal     *rawInternalConfig `toml:"internal"`
 }
 
 type rawConfigSource struct {
-	Type  string
-	Path  string
-	URL   string
-	Token string
+	Type  string `toml:"type"`
+	Path  string `toml:"path"`
+	URL   string `toml:"url"`
+	Token string `toml:"token"`
 }
 
 type rawServerConfig struct {
-	Addr    *string
-	BaseURL *string
+	Addr    *string `toml:"addr"`
+	BaseURL *string `toml:"base_url"`
 }
 
 type rawMySQLConfig struct {
-	DSNs         []string
-	TableCount   *int
-	MaxOpenConns *int
-	MaxIdleConns *int
+	DSNs         []string `toml:"dsns"`
+	TableCount   *int     `toml:"table_count"`
+	MaxOpenConns *int     `toml:"max_open_conns"`
+	MaxIdleConns *int     `toml:"max_idle_conns"`
 }
 
 type rawRedisConfig struct {
-	Addr       *string
-	Username   *string
-	Password   *string
-	DB         *int
-	CodeTTL    *string
-	LongURLTTL *string
-	LockTTL    *string
+	Addr       *string `toml:"addr"`
+	Username   *string `toml:"username"`
+	Password   *string `toml:"password"`
+	DB         *int    `toml:"db"`
+	CodeTTL    *string `toml:"code_ttl"`
+	LongURLTTL *string `toml:"long_url_ttl"`
+	LockTTL    *string `toml:"lock_ttl"`
 }
 
 type rawShortURLConfig struct {
-	DefaultExpire *string
+	DefaultExpire *string `toml:"default_expire"`
 }
 
 type rawInternalConfig struct {
-	APIToken         *string
-	AuthMode         *string
-	AuthHeader       *string
-	BatchCreateLimit *int
+	APIToken         *string `toml:"api_token"`
+	AuthMode         *string `toml:"auth_mode"`
+	AuthHeader       *string `toml:"auth_header"`
+	BatchCreateLimit *int    `toml:"batch_create_limit"`
 }
 
 func loadFileConfig(path string) (rawConfig, error) {
@@ -201,229 +202,12 @@ func loadHTTPConfig(ctx context.Context, url string, token string) (rawConfig, e
 }
 
 func decodeRawConfig(r io.Reader) (rawConfig, error) {
-	content, err := io.ReadAll(r)
-	if err != nil {
-		return rawConfig{}, fmt.Errorf("read config: %w", err)
-	}
-	raw, err := parseTOMLConfig(string(content))
-	if err != nil {
+	var raw rawConfig
+	decoder := toml.NewDecoder(r)
+	if _, err := decoder.Decode(&raw); err != nil {
 		return rawConfig{}, fmt.Errorf("decode config: %w", err)
 	}
 	return raw, nil
-}
-
-func parseTOMLConfig(content string) (rawConfig, error) {
-	var raw rawConfig
-	section := ""
-	for lineNo, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(stripComment(line))
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
-			continue
-		}
-
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			return rawConfig{}, fmt.Errorf("line %d: expected key = value", lineNo+1)
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		if err := applyTOMLValue(&raw, section, key, value); err != nil {
-			return rawConfig{}, fmt.Errorf("line %d: %w", lineNo+1, err)
-		}
-	}
-	return raw, nil
-}
-
-func applyTOMLValue(raw *rawConfig, section, key, value string) error {
-	switch section {
-	case "config_source":
-		if raw.ConfigSource == nil {
-			raw.ConfigSource = &rawConfigSource{}
-		}
-		switch key {
-		case "type":
-			raw.ConfigSource.Type = parseTOMLString(value)
-		case "path":
-			raw.ConfigSource.Path = parseTOMLString(value)
-		case "url":
-			raw.ConfigSource.URL = parseTOMLString(value)
-		case "token":
-			raw.ConfigSource.Token = parseTOMLString(value)
-		default:
-			return fmt.Errorf("unknown config_source.%s", key)
-		}
-	case "server":
-		if raw.Server == nil {
-			raw.Server = &rawServerConfig{}
-		}
-		switch key {
-		case "addr":
-			raw.Server.Addr = stringPtr(parseTOMLString(value))
-		case "base_url":
-			raw.Server.BaseURL = stringPtr(parseTOMLString(value))
-		default:
-			return fmt.Errorf("unknown server.%s", key)
-		}
-	case "mysql":
-		if raw.MySQL == nil {
-			raw.MySQL = &rawMySQLConfig{}
-		}
-		switch key {
-		case "dsns":
-			raw.MySQL.DSNs = parseTOMLStringArray(value)
-		case "table_count":
-			raw.MySQL.TableCount = intPtr(parseTOMLInt(value))
-		case "max_open_conns":
-			raw.MySQL.MaxOpenConns = intPtr(parseTOMLInt(value))
-		case "max_idle_conns":
-			raw.MySQL.MaxIdleConns = intPtr(parseTOMLInt(value))
-		default:
-			return fmt.Errorf("unknown mysql.%s", key)
-		}
-	case "redis":
-		if raw.Redis == nil {
-			raw.Redis = &rawRedisConfig{}
-		}
-		switch key {
-		case "addr":
-			raw.Redis.Addr = stringPtr(parseTOMLString(value))
-		case "username":
-			raw.Redis.Username = stringPtr(parseTOMLString(value))
-		case "password":
-			raw.Redis.Password = stringPtr(parseTOMLString(value))
-		case "db":
-			raw.Redis.DB = intPtr(parseTOMLInt(value))
-		case "code_ttl":
-			raw.Redis.CodeTTL = stringPtr(parseTOMLString(value))
-		case "long_url_ttl":
-			raw.Redis.LongURLTTL = stringPtr(parseTOMLString(value))
-		case "lock_ttl":
-			raw.Redis.LockTTL = stringPtr(parseTOMLString(value))
-		default:
-			return fmt.Errorf("unknown redis.%s", key)
-		}
-	case "short_url":
-		if raw.ShortURL == nil {
-			raw.ShortURL = &rawShortURLConfig{}
-		}
-		switch key {
-		case "default_expire":
-			raw.ShortURL.DefaultExpire = stringPtr(parseTOMLString(value))
-		default:
-			return fmt.Errorf("unknown short_url.%s", key)
-		}
-	case "internal":
-		if raw.Internal == nil {
-			raw.Internal = &rawInternalConfig{}
-		}
-		switch key {
-		case "api_token":
-			raw.Internal.APIToken = stringPtr(parseTOMLString(value))
-		case "auth_mode":
-			raw.Internal.AuthMode = stringPtr(parseTOMLString(value))
-		case "auth_header":
-			raw.Internal.AuthHeader = stringPtr(parseTOMLString(value))
-		case "batch_create_limit":
-			raw.Internal.BatchCreateLimit = intPtr(parseTOMLInt(value))
-		default:
-			return fmt.Errorf("unknown internal.%s", key)
-		}
-	default:
-		return fmt.Errorf("unknown section %q", section)
-	}
-	return nil
-}
-
-func stripComment(line string) string {
-	inString := false
-	escaped := false
-	for i, r := range line {
-		if escaped {
-			escaped = false
-			continue
-		}
-		if r == '\\' && inString {
-			escaped = true
-			continue
-		}
-		if r == '"' {
-			inString = !inString
-			continue
-		}
-		if r == '#' && !inString {
-			return line[:i]
-		}
-	}
-	return line
-}
-
-func parseTOMLString(value string) string {
-	value = strings.TrimSpace(value)
-	parsed, err := strconv.Unquote(value)
-	if err == nil {
-		return parsed
-	}
-	return strings.Trim(value, `"`)
-}
-
-func parseTOMLInt(value string) int {
-	parsed, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil {
-		return 0
-	}
-	return parsed
-}
-
-func parseTOMLStringArray(value string) []string {
-	value = strings.TrimSpace(value)
-	value = strings.TrimSuffix(strings.TrimPrefix(value, "["), "]")
-	if strings.TrimSpace(value) == "" {
-		return nil
-	}
-
-	var result []string
-	var current strings.Builder
-	inString := false
-	escaped := false
-	for _, r := range value {
-		if escaped {
-			current.WriteRune(r)
-			escaped = false
-			continue
-		}
-		if r == '\\' && inString {
-			current.WriteRune(r)
-			escaped = true
-			continue
-		}
-		if r == '"' {
-			current.WriteRune(r)
-			inString = !inString
-			continue
-		}
-		if r == ',' && !inString {
-			result = append(result, parseTOMLString(current.String()))
-			current.Reset()
-			continue
-		}
-		current.WriteRune(r)
-	}
-	if strings.TrimSpace(current.String()) != "" {
-		result = append(result, parseTOMLString(current.String()))
-	}
-	return result
-}
-
-func stringPtr(value string) *string {
-	return &value
-}
-
-func intPtr(value int) *int {
-	return &value
 }
 
 func applyRawConfig(cfg *Config, raw rawConfig) {

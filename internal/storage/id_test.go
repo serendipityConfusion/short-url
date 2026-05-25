@@ -4,7 +4,7 @@ import "testing"
 
 func TestGlobalIDRoundTrip(t *testing.T) {
 	for _, total := range []uint32{1, 16, 64} {
-		for bucket := uint32(0); bucket < total; bucket++ {
+		for bucket := range total {
 			globalID, err := ComposeGlobalID(12345, bucket, total)
 			if err != nil {
 				t.Fatalf("compose: %v", err)
