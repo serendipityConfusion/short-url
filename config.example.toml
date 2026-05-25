@@ -1,0 +1,27 @@
+[server]
+addr = ":8080"
+base_url = "http://localhost:8080"
+
+[mysql]
+dsns = ["user:password@tcp(127.0.0.1:3306)/short_url_0?parseTime=true&charset=utf8mb4&loc=UTC"]
+table_count = 16
+max_open_conns = 50
+max_idle_conns = 10
+
+[redis]
+addr = "127.0.0.1:6379"
+username = ""
+password = ""
+db = 0
+code_ttl = "24h"
+long_url_ttl = "24h"
+lock_ttl = "3s"
+
+[short_url]
+default_expire = "0"
+
+[internal]
+auth_mode = "any"
+api_token = "change-me"
+auth_header = "X-Internal-Token"
+batch_create_limit = 100
