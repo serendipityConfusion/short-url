@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 
 	"short-url/internal/base62"
 	"short-url/internal/storage"
@@ -20,13 +21,13 @@ type Store interface {
 	FindByHash(ctx context.Context, urlHash string) (storage.URLRecord, error)
 	FindByCode(ctx context.Context, code string, globalID uint64) (storage.URLRecord, error)
 	UpdateShortCode(ctx context.Context, record storage.URLRecord, shortCode string) error
+	UpdateExpiresAt(ctx context.Context, record storage.URLRecord, expiresAt sql.NullTime) error
 }
 
 type Options struct {
 	BaseURL       string
 	CodeTTL       time.Duration
 	LongURLTTL    time.Duration
-	LockTTL       time.Duration
 	DefaultExpire time.Duration
 }
 
@@ -58,9 +59,10 @@ type LookupResult struct {
 }
 
 type Shortener struct {
-	store Store
-	redis *redis.Client
-	opts  Options
+	store       Store
+	redis       *redis.Client
+	opts        Options
+	createGroup singleflight.Group
 }
 
 func NewShortener(store Store, redisClient *redis.Client, opts Options) *Shortener {
@@ -70,10 +72,11 @@ func NewShortener(store Store, redisClient *redis.Client, opts Options) *Shorten
 	if opts.LongURLTTL == 0 {
 		opts.LongURLTTL = 24 * time.Hour
 	}
-	if opts.LockTTL == 0 {
-		opts.LockTTL = 3 * time.Second
+	return &Shortener{
+		store: store,
+		redis: redisClient,
+		opts:  opts,
 	}
-	return &Shortener{store: store, redis: redisClient, opts: opts}
 }
 
 func (s *Shortener) Create(ctx context.Context, req CreateRequest) (CreateResult, error) {
@@ -93,20 +96,28 @@ func (s *Shortener) Create(ctx context.Context, req CreateRequest) (CreateResult
 		}, nil
 	}
 
-	unlock := s.tryLock(ctx, "short-url:lock:"+urlHash)
-	if unlock != nil {
-		defer unlock()
-	}
+	return s.createOnce(ctx, createFlightKey(urlHash, req), func() (CreateResult, error) {
+		if code, ok := s.getString(ctx, longKey); ok {
+			return CreateResult{
+				Code:     code,
+				ShortURL: s.shortURL(code),
+				URL:      normalized,
+				Reused:   true,
+			}, nil
+		}
+		return s.createFromStore(ctx, req, normalized, urlHash)
+	})
+}
 
-	if code, ok := s.getString(ctx, longKey); ok {
-		return CreateResult{
-			Code:     code,
-			ShortURL: s.shortURL(code),
-			URL:      normalized,
-			Reused:   true,
-		}, nil
-	}
+func (s *Shortener) createFromStore(ctx context.Context, req CreateRequest, normalized string, urlHash string) (CreateResult, error) {
 	if record, err := s.store.FindByHash(ctx, urlHash); err == nil {
+		if isExpired(record.ExpiresAt) {
+			expiresAt := s.expiration(req)
+			if err := s.store.UpdateExpiresAt(ctx, record, expiresAt); err != nil {
+				return CreateResult{}, err
+			}
+			record.ExpiresAt = expiresAt
+		}
 		code, err := s.ensureCode(ctx, record)
 		if err != nil {
 			return CreateResult{}, err
@@ -131,6 +142,36 @@ func (s *Shortener) Create(ctx context.Context, req CreateRequest) (CreateResult
 	return resultFromRecord(s.shortURL(code), code, record, false), nil
 }
 
+func (s *Shortener) createOnce(ctx context.Context, key string, fn func() (CreateResult, error)) (CreateResult, error) {
+	resultCh := s.createGroup.DoChan(key, func() (any, error) {
+		return fn()
+	})
+
+	select {
+	case result := <-resultCh:
+		if result.Err != nil {
+			return CreateResult{}, result.Err
+		}
+		createResult, ok := result.Val.(CreateResult)
+		if !ok {
+			return CreateResult{}, errors.New("unexpected singleflight create result")
+		}
+		return createResult, nil
+	case <-ctx.Done():
+		return CreateResult{}, ctx.Err()
+	}
+}
+
+func createFlightKey(urlHash string, req CreateRequest) string {
+	if req.ExpireAt != nil {
+		return urlHash + "|at:" + req.ExpireAt.UTC().Format(time.RFC3339Nano)
+	}
+	if req.ExpireIn > 0 {
+		return urlHash + "|in:" + req.ExpireIn.String()
+	}
+	return urlHash + "|default"
+}
+
 func (s *Shortener) Resolve(ctx context.Context, code string) (string, error) {
 	code = strings.TrimSpace(code)
 	if code == "" {
@@ -148,7 +189,7 @@ func (s *Shortener) Resolve(ctx context.Context, code string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if record.ExpiresAt.Valid && time.Now().After(record.ExpiresAt.Time) {
+	if isExpired(record.ExpiresAt) {
 		return "", storage.ErrNotFound
 	}
 
@@ -171,7 +212,7 @@ func (s *Shortener) Lookup(ctx context.Context, code string) (LookupResult, erro
 		return LookupResult{}, err
 	}
 
-	expired := record.ExpiresAt.Valid && time.Now().After(record.ExpiresAt.Time)
+	expired := isExpired(record.ExpiresAt)
 	if !expired {
 		s.cacheCode(ctx, code, record.OriginalURL, record.ExpiresAt)
 	}
@@ -240,6 +281,10 @@ func ttlBeforeExpiration(ttl time.Duration, expiresAt sql.NullTime) (time.Durati
 	return ttl, true
 }
 
+func isExpired(expiresAt sql.NullTime) bool {
+	return expiresAt.Valid && time.Now().After(expiresAt.Time)
+}
+
 func (s *Shortener) getString(ctx context.Context, key string) (string, bool) {
 	if s.redis == nil {
 		return "", false
@@ -256,26 +301,6 @@ func (s *Shortener) setString(ctx context.Context, key, value string, ttl time.D
 		return
 	}
 	_ = s.redis.Set(ctx, key, value, ttl).Err()
-}
-
-func (s *Shortener) tryLock(ctx context.Context, key string) func() {
-	if s.redis == nil {
-		return nil
-	}
-	token := fmt.Sprintf("%d", time.Now().UnixNano())
-	ok, err := s.redis.SetNX(ctx, key, token, s.opts.LockTTL).Result()
-	if err != nil || !ok {
-		return nil
-	}
-	return func() {
-		script := redis.NewScript(`
-if redis.call("get", KEYS[1]) == ARGV[1] then
-	return redis.call("del", KEYS[1])
-end
-return 0
-`)
-		_ = script.Run(context.Background(), s.redis, []string{key}, token).Err()
-	}
 }
 
 func resultFromRecord(shortURL, code string, record storage.URLRecord, reused bool) CreateResult {

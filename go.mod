@@ -6,6 +6,7 @@ require (
 	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/redis/go-redis/v9 v9.16.0
+	golang.org/x/sync v0.20.0
 )
 
 require (

@@ -40,7 +40,6 @@ type RedisConfig struct {
 	DB         int
 	CodeTTL    time.Duration
 	LongURLTTL time.Duration
-	LockTTL    time.Duration
 }
 
 type ShortURLConfig struct {
@@ -91,7 +90,6 @@ func defaultConfig() Config {
 		Redis: RedisConfig{
 			CodeTTL:    24 * time.Hour,
 			LongURLTTL: 24 * time.Hour,
-			LockTTL:    3 * time.Second,
 		},
 		Internal: InternalConfig{
 			AuthHeader:       "X-Internal-Token",
@@ -135,7 +133,6 @@ type rawRedisConfig struct {
 	DB         *int    `toml:"db"`
 	CodeTTL    *string `toml:"code_ttl"`
 	LongURLTTL *string `toml:"long_url_ttl"`
-	LockTTL    *string `toml:"lock_ttl"`
 }
 
 type rawShortURLConfig struct {
@@ -251,9 +248,6 @@ func applyRawConfig(cfg *Config, raw rawConfig) {
 		}
 		if raw.Redis.LongURLTTL != nil {
 			cfg.Redis.LongURLTTL = parseDuration(*raw.Redis.LongURLTTL, cfg.Redis.LongURLTTL)
-		}
-		if raw.Redis.LockTTL != nil {
-			cfg.Redis.LockTTL = parseDuration(*raw.Redis.LockTTL, cfg.Redis.LockTTL)
 		}
 	}
 	if raw.ShortURL != nil && raw.ShortURL.DefaultExpire != nil {

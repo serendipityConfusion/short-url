@@ -69,7 +69,6 @@ func main() {
 		BaseURL:       cfg.Server.BaseURL,
 		CodeTTL:       cfg.Redis.CodeTTL,
 		LongURLTTL:    cfg.Redis.LongURLTTL,
-		LockTTL:       cfg.Redis.LockTTL,
 		DefaultExpire: cfg.ShortURL.DefaultExpire,
 	})
 

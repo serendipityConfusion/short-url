@@ -163,6 +163,16 @@ func (s *ShardedStore) UpdateShortCode(ctx context.Context, record URLRecord, sh
 	return err
 }
 
+func (s *ShardedStore) UpdateExpiresAt(ctx context.Context, record URLRecord, expiresAt sql.NullTime) error {
+	db, table := s.route(record.Bucket)
+	_, err := db.ExecContext(ctx,
+		fmt.Sprintf("UPDATE %s SET expires_at = ? WHERE id = ?", tableName(table)),
+		nullableTimeArg(expiresAt),
+		record.ID,
+	)
+	return err
+}
+
 func (s *ShardedStore) route(bucket uint32) (*sql.DB, int) {
 	dbIndex := int(bucket) / s.tableCount
 	tableIndex := int(bucket) % s.tableCount

@@ -1,6 +1,6 @@
 # Short URL
 
-Go 短链服务，支持 MySQL 分库分表、数据库自增 ID 唯一性、Base62 压缩短码，以及 Redis 缓存/锁来降低重复生成和重定向读压力。
+Go 短链服务，支持 MySQL 分库分表、数据库自增 ID 唯一性、Base62 压缩短码，以及 Redis 缓存来降低重复生成和重定向读压力。
 
 ## 核心设计
 
@@ -8,7 +8,8 @@ Go 短链服务，支持 MySQL 分库分表、数据库自增 ID 唯一性、Bas
 - 分库分表：`bucket / table_count` 选择数据库，`bucket % table_count` 选择表，例如 `short_urls_03`。
 - 唯一 ID：每个物理表使用 MySQL 自增 ID。服务把 `local_id + bucket` 组合成全局数字 ID：`global_id = (local_id - 1) * total_buckets + bucket + 1`。
 - 短码生成：对 `global_id` 做 Base62 编码。解析短码时可反解出 bucket 和 local ID，直接命中对应库表。
-- 去重与缓存：Redis 缓存 `long_url_hash -> code` 和 `code -> original_url`，并用短 TTL 分布式锁减少并发重复创建。数据库层仍用 `url_hash` 唯一索引兜底。
+- 去重与缓存：Redis 缓存 `long_url_hash -> code` 和 `code -> original_url`；服务内用本地 singleflight 合并同一实例上的重复创建请求；数据库层用 `url_hash` 唯一索引保证同一个 URL 只创建一条记录，并作为跨实例并发去重兜底。
+- 过期复用：同一个 URL 已过期后再次创建时，复用原短码并更新 `expires_at`，避免 `url_hash` 唯一索引导致过期链接无法重新启用。
 
 ## 完整流程图
 
@@ -18,7 +19,7 @@ Go 短链服务，支持 MySQL 分库分表、数据库自增 ID 唯一性、Bas
 flowchart LR
   client["Client"] --> api["HTTP API"]
   api --> shortener["Shortener Service"]
-  shortener --> redis["Redis Cache / Lock"]
+  shortener --> redis["Redis Cache"]
   shortener --> store["Sharded Store"]
   store --> router["Bucket Router"]
   router --> db0["MySQL DB 0"]
@@ -37,12 +38,15 @@ flowchart TD
   validate --> hash["计算 url_hash = SHA-256(original_url)"]
   hash --> cacheLong{"Redis 存在 long_url_hash -> code?"}
   cacheLong -- "是" --> returnCached["返回已存在短链 reused=true"]
-  cacheLong -- "否" --> lock["尝试获取 Redis 分布式锁"]
-  lock --> cacheAgain{"再次检查 long_url_hash -> code"}
+  cacheLong -- "否" --> singleflight["本地 singleflight 合并同 URL 同过期参数的并发创建"]
+  singleflight --> cacheAgain{"再次检查 long_url_hash -> code"}
   cacheAgain -- "是" --> returnCached
   cacheAgain -- "否" --> findHash["按 url_hash 路由到分片表查询"]
   findHash --> existed{"数据库已有记录?"}
-  existed -- "是" --> ensureCode["若 short_code 为空则补写短码"]
+  existed -- "是" --> expiredExisting{"已有记录已过期?"}
+  expiredExisting -- "是" --> refreshExpire["按本次请求更新 expires_at"]
+  expiredExisting -- "否" --> ensureCode["若 short_code 为空则补写短码"]
+  refreshExpire --> ensureCode
   existed -- "否" --> bucket["根据 url_hash 计算 bucket"]
   bucket --> route["bucket / table_count 选库, bucket % table_count 选表"]
   route --> insert["插入 url_hash, original_url, expires_at"]

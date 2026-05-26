@@ -15,7 +15,6 @@ password = ""
 db = 0
 code_ttl = "24h"
 long_url_ttl = "24h"
-lock_ttl = "3s"
 
 [short_url]
 default_expire = "0"
