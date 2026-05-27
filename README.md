@@ -8,7 +8,7 @@ Go 短链服务，支持 MySQL 分库分表、数据库自增 ID 唯一性、Bas
 - 分库分表：`bucket / table_count` 选择数据库，`bucket % table_count` 选择表，例如 `short_urls_03`。
 - 唯一 ID：每个物理表使用 MySQL 自增 ID。服务把 `local_id + bucket` 组合成全局数字 ID：`global_id = (local_id - 1) * total_buckets + bucket + 1`。
 - 短码生成：对 `global_id` 做 Base62 编码。解析短码时可反解出 bucket 和 local ID，直接命中对应库表。
-- 去重与缓存：Redis 缓存 `long_url_hash -> code` 和 `code -> original_url`；服务内用本地 singleflight 合并同一实例上的重复创建请求；数据库层用 `url_hash` 唯一索引保证同一个 URL 只创建一条记录，并作为跨实例并发去重兜底。
+- 去重与缓存：Redis 缓存 `long_url_hash -> code` 和 `code -> target_url`；服务内用本地 singleflight 合并同一实例上的重复创建请求；数据库层用 `url_hash` 唯一索引保证同一个 URL 只创建一条记录，并作为跨实例并发去重兜底。
 - 过期复用：同一个 URL 已过期后再次创建时，复用原短码并更新 `expires_at`，避免 `url_hash` 唯一索引导致过期链接无法重新启用。
 
 ## 完整流程图
@@ -54,7 +54,7 @@ flowchart TD
   localID --> globalID["组合 global_id = (local_id - 1) * total_buckets + bucket + 1"]
   globalID --> base62["Base62 编码生成 short_code"]
   base62 --> updateCode["回写 short_code"]
-  updateCode --> writeCache["写入 Redis: long_url_hash -> code, code -> original_url"]
+  updateCode --> writeCache["写入 Redis: long_url_hash -> code, code -> target_url"]
   ensureCode --> writeCache
   writeCache --> done["返回短链"]
 ```
@@ -64,8 +64,8 @@ flowchart TD
 ```mermaid
 flowchart TD
   start["GET /{code}"] --> normalize["读取并清理 code"]
-  normalize --> cacheCode{"Redis 存在 code -> original_url?"}
-  cacheCode -- "是" --> redirectCached["302 跳转 original_url"]
+  normalize --> cacheCode{"Redis 存在 code -> target_url?"}
+  cacheCode -- "是" --> redirectCached["302 跳转 target_url"]
   cacheCode -- "否" --> decode["Base62 解码得到 global_id"]
   decode --> split["拆分 local_id 和 bucket"]
   split --> route["根据 bucket 选库选表"]
@@ -74,8 +74,9 @@ flowchart TD
   found -- "否" --> notFound["返回 404"]
   found -- "是" --> expired{"expires_at 已过期?"}
   expired -- "是" --> notFound
-  expired -- "否" --> writeCache["写入 Redis: code -> original_url"]
-  writeCache --> redirect["302 跳转 original_url"]
+  expired -- "否" --> target["取 redirect_url, 为空则回退 original_url"]
+  target --> writeCache["写入 Redis: code -> target_url"]
+  writeCache --> redirect["302 跳转 target_url"]
 ```
 
 内部批量创建短链：
@@ -113,6 +114,20 @@ flowchart TD
   expired --> response["返回短链详情"]
 ```
 
+内部更新跳转地址：
+
+```mermaid
+flowchart TD
+  start["PATCH /internal/api/v1/short-links/{code}/redirect"] --> auth{"内部鉴权通过?"}
+  auth -- "否" --> unauthorized["401 Unauthorized / 404 Disabled"]
+  auth -- "是" --> validate["校验新的跳转 URL"]
+  validate --> decode["Base62 解码 code"]
+  decode --> route["反解 bucket 和 local_id 后选库选表"]
+  route --> update["更新 redirect_url"]
+  update --> cache["刷新 Redis: code -> redirect_url"]
+  cache --> response["返回更新后的短链详情"]
+```
+
 ## 表结构设计
 
 当前部署脚本会创建一个逻辑库 `short_url_0`，并在库内创建 16 张同构分表：
@@ -126,6 +141,7 @@ CREATE TABLE IF NOT EXISTS short_urls_00 (
   url_hash CHAR(64) NOT NULL,
   short_code VARCHAR(32) NOT NULL DEFAULT '',
   original_url TEXT NOT NULL,
+  redirect_url TEXT NULL,
   expires_at DATETIME NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -152,6 +168,7 @@ CREATE TABLE IF NOT EXISTS short_urls_15 LIKE short_urls_00;
 | `url_hash` | `CHAR(64)` | 原始 URL 规范化后的 SHA-256 值，用于去重和分片路由。 |
 | `short_code` | `VARCHAR(32)` | Base62 短码，由 `global_id` 编码生成。初始插入后再回写。 |
 | `original_url` | `TEXT` | 规范化后的原始长链接。 |
+| `redirect_url` | `TEXT NULL` | 可选的当前跳转地址。为空时跳转到 `original_url`。 |
 | `expires_at` | `DATETIME NULL` | 过期时间，为空表示不过期。 |
 | `created_at` | `DATETIME` | 创建时间。 |
 | `updated_at` | `DATETIME` | 更新时间，记录变更时自动刷新。 |
@@ -287,11 +304,23 @@ curl http://localhost:8080/internal/api/v1/short-links/1B \
   "code": "1B",
   "short_url": "http://localhost:8080/1B",
   "url": "https://example.com/a",
+  "original_url": "https://example.com/a",
   "created_at": "2026-05-24T10:00:00Z",
   "updated_at": "2026-05-24T10:00:00Z",
   "expired": false
 }
 ```
+
+根据短码更新跳转地址：
+
+```bash
+curl -X PATCH http://localhost:8080/internal/api/v1/short-links/1B/redirect \
+  -H 'authorization: Bearer change-me' \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/new-target"}'
+```
+
+更新后，访问 `/{code}` 会跳转到新的 `url`；`original_url` 保持为创建短链时的原始地址，用于分片路由和去重。
 
 ## 本地运行
 

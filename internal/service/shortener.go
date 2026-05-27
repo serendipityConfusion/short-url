@@ -22,6 +22,7 @@ type Store interface {
 	FindByCode(ctx context.Context, code string, globalID uint64) (storage.URLRecord, error)
 	UpdateShortCode(ctx context.Context, record storage.URLRecord, shortCode string) error
 	UpdateExpiresAt(ctx context.Context, record storage.URLRecord, expiresAt sql.NullTime) error
+	UpdateRedirectURL(ctx context.Context, record storage.URLRecord, redirectURL string) error
 }
 
 type Options struct {
@@ -52,10 +53,16 @@ type LookupResult struct {
 	Code      string     `json:"code"`
 	ShortURL  string     `json:"short_url"`
 	URL       string     `json:"url"`
+	Original  string     `json:"original_url"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at"`
 	Expired   bool       `json:"expired"`
+}
+
+type UpdateRedirectRequest struct {
+	Code string
+	URL  string
 }
 
 type Shortener struct {
@@ -122,7 +129,7 @@ func (s *Shortener) createFromStore(ctx context.Context, req CreateRequest, norm
 		if err != nil {
 			return CreateResult{}, err
 		}
-		s.cacheCreateResult(ctx, code, normalized, urlHash, record.ExpiresAt)
+		s.cacheCreateResult(ctx, code, record.TargetURL(), urlHash, record.ExpiresAt)
 		return resultFromRecord(s.shortURL(code), code, record, true), nil
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return CreateResult{}, err
@@ -193,8 +200,9 @@ func (s *Shortener) Resolve(ctx context.Context, code string) (string, error) {
 		return "", storage.ErrNotFound
 	}
 
-	s.cacheCode(ctx, code, record.OriginalURL, record.ExpiresAt)
-	return record.OriginalURL, nil
+	targetURL := record.TargetURL()
+	s.cacheCode(ctx, code, targetURL, record.ExpiresAt)
+	return targetURL, nil
 }
 
 func (s *Shortener) Lookup(ctx context.Context, code string) (LookupResult, error) {
@@ -214,9 +222,35 @@ func (s *Shortener) Lookup(ctx context.Context, code string) (LookupResult, erro
 
 	expired := isExpired(record.ExpiresAt)
 	if !expired {
-		s.cacheCode(ctx, code, record.OriginalURL, record.ExpiresAt)
+		s.cacheCode(ctx, code, record.TargetURL(), record.ExpiresAt)
 	}
 	return lookupResultFromRecord(s.shortURL(code), code, record, expired), nil
+}
+
+func (s *Shortener) UpdateRedirect(ctx context.Context, req UpdateRedirectRequest) (LookupResult, error) {
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		return LookupResult{}, storage.ErrNotFound
+	}
+	normalized, err := storage.NormalizeURL(req.URL)
+	if err != nil {
+		return LookupResult{}, err
+	}
+
+	record, err := s.findRecordByCode(ctx, code)
+	if err != nil {
+		return LookupResult{}, err
+	}
+	if err := s.store.UpdateRedirectURL(ctx, record, normalized); err != nil {
+		return LookupResult{}, err
+	}
+
+	record.RedirectURL = sql.NullString{String: normalized, Valid: true}
+	record.UpdatedAt = time.Now().UTC()
+	if !isExpired(record.ExpiresAt) {
+		s.cacheCode(ctx, code, normalized, record.ExpiresAt)
+	}
+	return lookupResultFromRecord(s.shortURL(code), code, record, isExpired(record.ExpiresAt)), nil
 }
 
 func (s *Shortener) ensureCode(ctx context.Context, record storage.URLRecord) (string, error) {
@@ -232,6 +266,14 @@ func (s *Shortener) ensureCode(ctx context.Context, record storage.URLRecord) (s
 		return "", err
 	}
 	return code, nil
+}
+
+func (s *Shortener) findRecordByCode(ctx context.Context, code string) (storage.URLRecord, error) {
+	globalID, err := base62.Decode(code)
+	if err != nil {
+		return storage.URLRecord{}, storage.ErrNotFound
+	}
+	return s.store.FindByCode(ctx, code, globalID)
 }
 
 func (s *Shortener) expiration(req CreateRequest) sql.NullTime {
@@ -327,7 +369,8 @@ func lookupResultFromRecord(shortURL, code string, record storage.URLRecord, exp
 		Bucket:    record.Bucket,
 		Code:      code,
 		ShortURL:  shortURL,
-		URL:       record.OriginalURL,
+		URL:       record.TargetURL(),
+		Original:  record.OriginalURL,
 		ExpiresAt: expiresAt,
 		CreatedAt: record.CreatedAt,
 		UpdatedAt: record.UpdatedAt,

@@ -19,6 +19,7 @@ type Shortener interface {
 	Create(rctx context.Context, req service.CreateRequest) (service.CreateResult, error)
 	Resolve(rctx context.Context, code string) (string, error)
 	Lookup(rctx context.Context, code string) (service.LookupResult, error)
+	UpdateRedirect(rctx context.Context, req service.UpdateRedirectRequest) (service.LookupResult, error)
 }
 
 type Options struct {
@@ -45,6 +46,7 @@ func RegisterRoutes(mux *http.ServeMux, shortener *service.Shortener, opts Optio
 	mux.HandleFunc("POST /api/v1/short-links", h.create)
 	mux.HandleFunc("POST /internal/api/v1/short-links/batch", h.internalBatchCreate)
 	mux.HandleFunc("GET /internal/api/v1/short-links/{code}", h.internalLookup)
+	mux.HandleFunc("PATCH /internal/api/v1/short-links/{code}/redirect", h.internalUpdateRedirect)
 	mux.HandleFunc("GET /{code}", h.redirect)
 }
 
@@ -75,6 +77,10 @@ type batchCreateItemResult struct {
 	OK     bool                  `json:"ok"`
 	Result *service.CreateResult `json:"result,omitempty"`
 	Error  string                `json:"error,omitempty"`
+}
+
+type updateRedirectRequest struct {
+	URL string `json:"url"`
 }
 
 func (h *handler) create(w http.ResponseWriter, r *http.Request) {
@@ -171,6 +177,36 @@ func (h *handler) internalLookup(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("internal lookup %q: %v", r.PathValue("code"), err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *handler) internalUpdateRedirect(w http.ResponseWriter, r *http.Request) {
+	if !h.requireInternalAuth(w, r) {
+		return
+	}
+	if r.Body == nil {
+		writeError(w, http.StatusBadRequest, "empty request body")
+		return
+	}
+
+	var payload updateRedirectRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+
+	result, err := h.shortener.UpdateRedirect(r.Context(), service.UpdateRedirectRequest{
+		Code: r.PathValue("code"),
+		URL:  payload.URL,
+	})
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

@@ -19,10 +19,18 @@ type URLRecord struct {
 	Bucket      uint32
 	ShortCode   string
 	OriginalURL string
+	RedirectURL sql.NullString
 	URLHash     string
 	ExpiresAt   sql.NullTime
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+}
+
+func (r URLRecord) TargetURL() string {
+	if r.RedirectURL.Valid && r.RedirectURL.String != "" {
+		return r.RedirectURL.String
+	}
+	return r.OriginalURL
 }
 
 type ShardedStore struct {
@@ -116,9 +124,9 @@ func (s *ShardedStore) FindByHash(ctx context.Context, urlHash string) (URLRecor
 	record.Bucket = bucket
 	record.URLHash = urlHash
 	err := db.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT id, short_code, original_url, expires_at, created_at, updated_at FROM %s WHERE url_hash = ? LIMIT 1", tableName(table)),
+		fmt.Sprintf("SELECT id, short_code, original_url, redirect_url, expires_at, created_at, updated_at FROM %s WHERE url_hash = ? LIMIT 1", tableName(table)),
 		urlHash,
-	).Scan(&record.ID, &record.ShortCode, &record.OriginalURL, &record.ExpiresAt, &record.CreatedAt, &record.UpdatedAt)
+	).Scan(&record.ID, &record.ShortCode, &record.OriginalURL, &record.RedirectURL, &record.ExpiresAt, &record.CreatedAt, &record.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return URLRecord{}, ErrNotFound
 	}
@@ -139,9 +147,9 @@ func (s *ShardedStore) FindByCode(ctx context.Context, code string, globalID uin
 	record.ID = localID
 	record.Bucket = bucket
 	err = db.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT short_code, original_url, url_hash, expires_at, created_at, updated_at FROM %s WHERE id = ? LIMIT 1", tableName(table)),
+		fmt.Sprintf("SELECT short_code, original_url, redirect_url, url_hash, expires_at, created_at, updated_at FROM %s WHERE id = ? LIMIT 1", tableName(table)),
 		localID,
-	).Scan(&record.ShortCode, &record.OriginalURL, &record.URLHash, &record.ExpiresAt, &record.CreatedAt, &record.UpdatedAt)
+	).Scan(&record.ShortCode, &record.OriginalURL, &record.RedirectURL, &record.URLHash, &record.ExpiresAt, &record.CreatedAt, &record.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return URLRecord{}, ErrNotFound
 	}
@@ -168,6 +176,16 @@ func (s *ShardedStore) UpdateExpiresAt(ctx context.Context, record URLRecord, ex
 	_, err := db.ExecContext(ctx,
 		fmt.Sprintf("UPDATE %s SET expires_at = ? WHERE id = ?", tableName(table)),
 		nullableTimeArg(expiresAt),
+		record.ID,
+	)
+	return err
+}
+
+func (s *ShardedStore) UpdateRedirectURL(ctx context.Context, record URLRecord, redirectURL string) error {
+	db, table := s.route(record.Bucket)
+	_, err := db.ExecContext(ctx,
+		fmt.Sprintf("UPDATE %s SET redirect_url = ? WHERE id = ?", tableName(table)),
+		redirectURL,
 		record.ID,
 	)
 	return err

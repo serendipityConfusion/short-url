@@ -98,6 +98,39 @@ func TestCreateCoalescesConcurrentSameURL(t *testing.T) {
 	}
 }
 
+func TestUpdateRedirectChangesTargetURL(t *testing.T) {
+	now := time.Now().UTC()
+	store := &fakeStore{
+		record: storage.URLRecord{
+			ID:          1,
+			Bucket:      0,
+			ShortCode:   "1",
+			OriginalURL: "https://example.com/a",
+			URLHash:     storage.URLHash("https://example.com/a"),
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+	}
+	shortener := NewShortener(store, nil, Options{BaseURL: "http://short.test"})
+
+	result, err := shortener.UpdateRedirect(context.Background(), UpdateRedirectRequest{
+		Code: "1",
+		URL:  "https://example.com/new-target",
+	})
+	if err != nil {
+		t.Fatalf("update redirect: %v", err)
+	}
+	if result.URL != "https://example.com/new-target" {
+		t.Fatalf("url = %q", result.URL)
+	}
+	if result.Original != "https://example.com/a" {
+		t.Fatalf("original = %q", result.Original)
+	}
+	if got := store.record.TargetURL(); got != "https://example.com/new-target" {
+		t.Fatalf("target = %q", got)
+	}
+}
+
 type fakeStore struct {
 	record           storage.URLRecord
 	updatedExpiresAt sql.NullTime
@@ -118,7 +151,10 @@ func (s *fakeStore) FindByHash(_ context.Context, urlHash string) (storage.URLRe
 	return s.record, nil
 }
 
-func (s *fakeStore) FindByCode(context.Context, string, uint64) (storage.URLRecord, error) {
+func (s *fakeStore) FindByCode(_ context.Context, code string, _ uint64) (storage.URLRecord, error) {
+	if code == s.record.ShortCode {
+		return s.record, nil
+	}
 	return storage.URLRecord{}, storage.ErrNotFound
 }
 
@@ -132,6 +168,12 @@ func (s *fakeStore) UpdateExpiresAt(_ context.Context, record storage.URLRecord,
 	s.updatedExpiresAt = expiresAt
 	s.record = record
 	s.record.ExpiresAt = expiresAt
+	return nil
+}
+
+func (s *fakeStore) UpdateRedirectURL(_ context.Context, record storage.URLRecord, redirectURL string) error {
+	s.record = record
+	s.record.RedirectURL = sql.NullString{String: redirectURL, Valid: true}
 	return nil
 }
 
@@ -185,5 +227,9 @@ func (s *blockingCreateStore) UpdateShortCode(context.Context, storage.URLRecord
 }
 
 func (s *blockingCreateStore) UpdateExpiresAt(context.Context, storage.URLRecord, sql.NullTime) error {
+	return nil
+}
+
+func (s *blockingCreateStore) UpdateRedirectURL(context.Context, storage.URLRecord, string) error {
 	return nil
 }
